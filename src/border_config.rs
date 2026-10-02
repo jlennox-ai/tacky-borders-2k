@@ -4,7 +4,8 @@ use crate::animations::AnimationsConfig;
 use crate::border_drawer::BorderDrawer;
 use crate::colors::ColorBrushConfig;
 use crate::config::{
-    Global, Offset, OffsetConfig, RadiusConfig, WidthConfig, WindowRule, ZOrderMode,
+    BorderStyleConfig, Global, Offset, OffsetConfig, RadiusConfig, WidthConfig, WindowRule,
+    ZOrderMode,
 };
 use crate::effects::EffectsConfig;
 use crate::render_backend::RenderBackendConfig;
@@ -17,6 +18,7 @@ pub struct BorderConfig {
     pub offset: OffsetConfig,
     pub radius: RadiusConfig,
     pub z_order: ZOrderMode,
+    pub style: BorderStyleConfig,
     pub follow_native_border: bool,
     pub active_color: ColorBrushConfig,
     pub inactive_color: ColorBrushConfig,
@@ -39,6 +41,7 @@ impl BorderConfig {
             offset: window_rule.border_offset.unwrap_or(global.border_offset),
             radius: window_rule.border_radius.unwrap_or(global.border_radius),
             z_order: window_rule.border_z_order.unwrap_or(global.border_z_order),
+            style: window_rule.border_style.unwrap_or(global.border_style),
             follow_native_border: window_rule
                 .follow_native_border
                 .unwrap_or(global.follow_native_border),

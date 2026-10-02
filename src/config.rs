@@ -70,6 +70,8 @@ pub struct Global {
     pub border_radius: RadiusConfig,
     #[serde(default)]
     pub border_z_order: ZOrderMode,
+    #[serde(default)]
+    pub border_style: BorderStyleConfig,
     #[serde(default = "serde_default_bool::<true>")]
     pub follow_native_border: bool,
     #[serde(default)]
@@ -118,6 +120,7 @@ pub struct WindowRule {
     pub border_offset: Option<OffsetConfig>,
     pub border_radius: Option<RadiusConfig>,
     pub border_z_order: Option<ZOrderMode>,
+    pub border_style: Option<BorderStyleConfig>,
     pub follow_native_border: Option<bool>,
     pub active_color: Option<ColorBrushConfig>,
     pub inactive_color: Option<ColorBrushConfig>,
@@ -277,6 +280,16 @@ pub enum ZOrderMode {
     #[default]
     AboveWindow,
     BelowWindow,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+pub enum BorderStyleConfig {
+    /// A flat, single-color border (the default)
+    #[default]
+    Modern,
+    /// A classic Windows 2000-style frame: dark outlines, a raised 3D bevel around a medium
+    /// face band, and corner separator notches. Bevel tones are derived from the border color.
+    Win2k,
 }
 
 impl Config {

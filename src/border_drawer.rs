@@ -2,20 +2,23 @@ use anyhow::Context;
 use std::time;
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+    D2D_RECT_F, D2D_SIZE_F, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_BRUSH_PROPERTIES, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, ID2D1Brush,
-    ID2D1Multithread, ID2D1RenderTarget,
+    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_BRUSH_PROPERTIES,
+    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE, ID2D1Brush,
+    ID2D1GeometrySink, ID2D1Multithread, ID2D1PathGeometry1, ID2D1RenderTarget,
 };
 use windows::Win32::Graphics::Dxgi::IDXGISurface;
 use windows::core::Interface;
-use windows_numerics::Matrix3x2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::APP_STATE;
 use crate::animations::{AnimType, Animations};
 use crate::border_config::BorderConfig;
 use crate::colors::ColorBrush;
+use crate::config::BorderStyleConfig;
 use crate::effects::Effects;
 use crate::render_backend::{RenderBackend, RenderBackendConfig, TARGET_BITMAP_PROPS};
 use crate::utils::{
@@ -31,6 +34,7 @@ pub struct BorderDrawer {
     // the snapped/arranged state where the borders are supposed to remain square
     pub corner_radius: WriteLockable<f32>,
     pub render_backend: RenderBackend,
+    pub style: BorderStyleConfig,
     pub active_color: ColorBrush,
     pub inactive_color: ColorBrush,
     pub animations: Animations,
@@ -46,6 +50,7 @@ impl BorderDrawer {
 
         self.stroke_width = stroke_width;
         self.corner_radius = WriteLockable::new(corner_radius);
+        self.style = config.style;
         self.active_color = config.active_color.to_color_brush(true);
         self.inactive_color = config.inactive_color.to_color_brush(false);
         self.animations = config.animations.to_animations();
@@ -196,7 +201,7 @@ impl BorderDrawer {
 
                 match bottom_color.get_brush() {
                     Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, render_target, id2d1_brush)
+                        self.draw_border(&stroke_rect, render_target, bottom_color, id2d1_brush)?
                     }
                     None => debug!("ID2D1Brush for bottom_color has not been created yet"),
                 }
@@ -208,7 +213,7 @@ impl BorderDrawer {
 
                 match top_color.get_brush() {
                     Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, render_target, id2d1_brush)
+                        self.draw_border(&stroke_rect, render_target, top_color, id2d1_brush)?
                     }
                     None => debug!("ID2D1Brush for top_color has not been created yet"),
                 }
@@ -275,7 +280,7 @@ impl BorderDrawer {
 
                 match bottom_color.get_brush() {
                     Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, d2d_context, id2d1_brush)
+                        self.draw_border(&stroke_rect, d2d_context, bottom_color, id2d1_brush)?
                     }
                     None => debug!("ID2D1Brush for bottom_color has not been created yet"),
                 }
@@ -287,7 +292,7 @@ impl BorderDrawer {
 
                 match top_color.get_brush() {
                     Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, d2d_context, id2d1_brush)
+                        self.draw_border(&stroke_rect, d2d_context, top_color, id2d1_brush)?
                     }
                     None => debug!("ID2D1Brush for top_color has not been created yet"),
                 }
@@ -485,6 +490,227 @@ impl BorderDrawer {
         Ok(())
     }
 
+    fn draw_border(
+        &self,
+        stroke_rect: &D2D1_ROUNDED_RECT,
+        renderer: &ID2D1RenderTarget,
+        color: &ColorBrush,
+        brush: &ID2D1Brush,
+    ) -> WindowsCompatibleResult<()> {
+        match self.style {
+            BorderStyleConfig::Modern => {
+                self.draw_rectangle(stroke_rect, renderer, brush);
+                Ok(())
+            }
+            BorderStyleConfig::Win2k => self.draw_win2k_frame(stroke_rect, renderer, color),
+        }
+    }
+
+    /// Draws a classic Windows 2000-style frame: a dark outer outline, a raised bevel (light
+    /// top-left, shadow bottom-right), a face band in the configured color, a sunken inner bevel,
+    /// a dark inner outline, and corner separator notches like classic resize frames had.
+    fn draw_win2k_frame(
+        &self,
+        stroke_rect: &D2D1_ROUNDED_RECT,
+        renderer: &ID2D1RenderTarget,
+        color: &ColorBrush,
+    ) -> WindowsCompatibleResult<()> {
+        let frame_width = self.stroke_width as f32;
+        if frame_width < 1.0 {
+            return Ok(());
+        }
+
+        // stroke_rect is inset by half the stroke width; recover the border's outer edge
+        let half_width = frame_width / 2.0;
+        let outer = D2D_RECT_F {
+            left: stroke_rect.rect.left - half_width,
+            top: stroke_rect.rect.top - half_width,
+            right: stroke_rect.rect.right + half_width,
+            bottom: stroke_rect.rect.bottom + half_width,
+        };
+        let outer_radius = match stroke_rect.radiusX {
+            0.0 => 0.0,
+            radius => radius + half_width,
+        };
+
+        let face = color.base_color();
+        let light = blend_toward(&face, 1.0, 0.75);
+        let shadow = blend_toward(&face, 0.0, 0.45);
+        let dark = blend_toward(&face, 0.0, 0.78);
+
+        // These brushes are recreated every render, but D2D solid color brushes are cheap
+        let brush_properties = D2D1_BRUSH_PROPERTIES {
+            opacity: color.get_opacity().to_windows_result(T_E_UNINIT)?,
+            transform: Matrix3x2::identity(),
+        };
+        let (light_brush, shadow_brush, dark_brush, face_brush) = unsafe {
+            (
+                renderer.CreateSolidColorBrush(&light, Some(&brush_properties))?,
+                renderer.CreateSolidColorBrush(&shadow, Some(&brush_properties))?,
+                renderer.CreateSolidColorBrush(&dark, Some(&brush_properties))?,
+                renderer.CreateSolidColorBrush(&face, Some(&brush_properties))?,
+            )
+        };
+        let light_brush: &ID2D1Brush = (&light_brush).into();
+        let shadow_brush: &ID2D1Brush = (&shadow_brush).into();
+        let dark_brush: &ID2D1Brush = (&dark_brush).into();
+        let face_brush: &ID2D1Brush = (&face_brush).into();
+
+        // Band layout from the outside in: dark outline, raised bevel, face, sunken bevel, dark
+        // outline. 'unit' is the 1px-equivalent line thickness, scaled with the frame width.
+        let unit = (frame_width / 6.0).max(1.0);
+        let face_width = (frame_width - unit * 4.0).max(0.0);
+        let mut inset = 0.0f32;
+
+        self.stroke_ring(renderer, &outer, outer_radius, inset, unit, dark_brush);
+        inset += unit;
+
+        self.stroke_bevel_ring(
+            renderer,
+            &outer,
+            outer_radius,
+            inset,
+            unit,
+            light_brush,
+            shadow_brush,
+        )?;
+        inset += unit;
+
+        if face_width > 0.0 {
+            self.stroke_ring(renderer, &outer, outer_radius, inset, face_width, face_brush);
+            inset += face_width;
+        }
+
+        self.stroke_bevel_ring(
+            renderer,
+            &outer,
+            outer_radius,
+            inset,
+            unit,
+            shadow_brush,
+            light_brush,
+        )?;
+        inset += unit;
+
+        self.stroke_ring(renderer, &outer, outer_radius, inset, unit, dark_brush);
+
+        self.draw_corner_separators(renderer, &outer, frame_width, unit, dark_brush);
+
+        Ok(())
+    }
+
+    /// Strokes one concentric ring of the frame, 'inset' pixels in from the outer edge.
+    fn stroke_ring(
+        &self,
+        renderer: &ID2D1RenderTarget,
+        outer: &D2D_RECT_F,
+        outer_radius: f32,
+        inset: f32,
+        thickness: f32,
+        brush: &ID2D1Brush,
+    ) {
+        let center_inset = inset + thickness / 2.0;
+        let rect = D2D_RECT_F {
+            left: outer.left + center_inset,
+            top: outer.top + center_inset,
+            right: outer.right - center_inset,
+            bottom: outer.bottom - center_inset,
+        };
+        let radius = (outer_radius - center_inset).max(0.0);
+
+        unsafe {
+            if radius <= 0.0 {
+                renderer.DrawRectangle(&rect, brush, thickness, None);
+            } else {
+                let rounded_rect = D2D1_ROUNDED_RECT {
+                    rect,
+                    radiusX: radius,
+                    radiusY: radius,
+                };
+                renderer.DrawRoundedRectangle(&rounded_rect, brush, thickness, None);
+            }
+        }
+    }
+
+    /// Strokes one ring in two halves for a 3D bevel: the top-left half (split at the corner arc
+    /// midpoints of the top-right and bottom-left corners) in one color, the rest in another.
+    fn stroke_bevel_ring(
+        &self,
+        renderer: &ID2D1RenderTarget,
+        outer: &D2D_RECT_F,
+        outer_radius: f32,
+        inset: f32,
+        thickness: f32,
+        top_left_brush: &ID2D1Brush,
+        bottom_right_brush: &ID2D1Brush,
+    ) -> WindowsCompatibleResult<()> {
+        let center_inset = inset + thickness / 2.0;
+        let rect = D2D_RECT_F {
+            left: outer.left + center_inset,
+            top: outer.top + center_inset,
+            right: outer.right - center_inset,
+            bottom: outer.bottom - center_inset,
+        };
+        let radius = (outer_radius - center_inset).max(0.0);
+
+        let top_left_path = build_half_ring_path(&rect, radius, true)?;
+        let bottom_right_path = build_half_ring_path(&rect, radius, false)?;
+
+        unsafe {
+            renderer.DrawGeometry(&top_left_path, top_left_brush, thickness, None);
+            renderer.DrawGeometry(&bottom_right_path, bottom_right_brush, thickness, None);
+        }
+
+        Ok(())
+    }
+
+    /// Draws the small notches that separate the corner sizing regions from the edges, like
+    /// classic resize frames had.
+    fn draw_corner_separators(
+        &self,
+        renderer: &ID2D1RenderTarget,
+        outer: &D2D_RECT_F,
+        frame_width: f32,
+        unit: f32,
+        brush: &ID2D1Brush,
+    ) {
+        let offset = frame_width * 5.0;
+
+        // Skip the separators if the window is too small for distinct corner regions
+        let window_width = outer.right - outer.left;
+        let window_height = outer.bottom - outer.top;
+        if window_width <= (offset + unit) * 2.0 || window_height <= (offset + unit) * 2.0 {
+            return;
+        }
+
+        let separator_rects = [
+            // Top edge
+            (outer.left + offset, outer.top, unit, frame_width),
+            (outer.right - offset - unit, outer.top, unit, frame_width),
+            // Bottom edge
+            (outer.left + offset, outer.bottom - frame_width, unit, frame_width),
+            (outer.right - offset - unit, outer.bottom - frame_width, unit, frame_width),
+            // Left edge
+            (outer.left, outer.top + offset, frame_width, unit),
+            (outer.left, outer.bottom - offset - unit, frame_width, unit),
+            // Right edge
+            (outer.right - frame_width, outer.top + offset, frame_width, unit),
+            (outer.right - frame_width, outer.bottom - offset - unit, frame_width, unit),
+        ];
+
+        unsafe {
+            for (left, top, width, height) in separator_rects {
+                let rect = D2D_RECT_F {
+                    left,
+                    top,
+                    right: left + width,
+                    bottom: top + height,
+                };
+                renderer.FillRectangle(&rect, brush);
+            }
+        }
+    }
+
     // NOTE: ID2D1DeviceContext implements From<&ID2D1DeviceContext> for &ID2D1RenderTarget
     fn draw_rectangle(
         &self,
@@ -588,4 +814,87 @@ impl BorderDrawer {
 
         Ok(())
     }
+}
+
+/// Linearly blends each color channel toward 'target' (0.0 = black, 1.0 = white) by 'amount',
+/// preserving alpha. Used to derive the Win2k bevel tones from the face color.
+fn blend_toward(color: &D2D1_COLOR_F, target: f32, amount: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        r: color.r + (target - color.r) * amount,
+        g: color.g + (target - color.g) * amount,
+        b: color.b + (target - color.b) * amount,
+        a: color.a,
+    }
+}
+
+/// Builds an open path tracing half of a (rounded) rectangle's outline, splitting at the midpoint
+/// of the top-right and bottom-left corner arcs (or at the corners themselves when radius is 0).
+/// The top-left half runs from the bottom-left split point up and across to the top-right split
+/// point; the bottom-right half is the remainder. Both are traced clockwise.
+fn build_half_ring_path(
+    rect: &D2D_RECT_F,
+    radius: f32,
+    top_left: bool,
+) -> WindowsCompatibleResult<ID2D1PathGeometry1> {
+    let geometry = unsafe { APP_STATE.render_factory.CreatePathGeometry()? };
+    let sink = unsafe { geometry.Open()? };
+
+    let r = radius;
+    // Distance from a corner of 'rect' to its arc's 45-degree midpoint, along each axis
+    let k = r * (1.0 - std::f32::consts::FRAC_1_SQRT_2);
+
+    let point = |x: f32, y: f32| Vector2 { X: x, Y: y };
+    let arc_to = |sink: &ID2D1GeometrySink, x: f32, y: f32| unsafe {
+        sink.AddArc(&D2D1_ARC_SEGMENT {
+            point: point(x, y),
+            size: D2D_SIZE_F {
+                width: r,
+                height: r,
+            },
+            rotationAngle: 0.0,
+            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+            arcSize: D2D1_ARC_SIZE_SMALL,
+        })
+    };
+
+    unsafe {
+        if top_left {
+            // Bottom-left arc midpoint -> up the left edge -> across the top edge -> top-right
+            // arc midpoint
+            sink.BeginFigure(
+                point(rect.left + k, rect.bottom - k),
+                D2D1_FIGURE_BEGIN_HOLLOW,
+            );
+            if r > 0.0 {
+                arc_to(&sink, rect.left, rect.bottom - r);
+            }
+            sink.AddLine(point(rect.left, rect.top + r));
+            if r > 0.0 {
+                arc_to(&sink, rect.left + r, rect.top);
+            }
+            sink.AddLine(point(rect.right - r, rect.top));
+            if r > 0.0 {
+                arc_to(&sink, rect.right - k, rect.top + k);
+            }
+        } else {
+            // Top-right arc midpoint -> down the right edge -> across the bottom edge ->
+            // bottom-left arc midpoint
+            sink.BeginFigure(point(rect.right - k, rect.top + k), D2D1_FIGURE_BEGIN_HOLLOW);
+            if r > 0.0 {
+                arc_to(&sink, rect.right, rect.top + r);
+            }
+            sink.AddLine(point(rect.right, rect.bottom - r));
+            if r > 0.0 {
+                arc_to(&sink, rect.right - r, rect.bottom);
+            }
+            sink.AddLine(point(rect.left + r, rect.bottom));
+            if r > 0.0 {
+                arc_to(&sink, rect.left + k, rect.bottom - k);
+            }
+        }
+        sink.EndFigure(D2D1_FIGURE_END_OPEN);
+        sink.Close()?;
+    }
+
+    Ok(geometry)
 }

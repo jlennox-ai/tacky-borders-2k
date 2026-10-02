@@ -204,6 +204,19 @@ impl ColorBrush {
         }
     }
 
+    /// The brush's base color: the solid color, or the first stop of a gradient. Used to derive
+    /// bevel tones for the Win2k border style.
+    pub fn base_color(&self) -> D2D1_COLOR_F {
+        match self {
+            ColorBrush::Solid(solid) => solid.color,
+            ColorBrush::Gradient(gradient) => gradient
+                .gradient_stops
+                .first()
+                .map(|stop| stop.color)
+                .unwrap_or_default(),
+        }
+    }
+
     pub fn get_brush(&self) -> Option<&ID2D1Brush> {
         match self {
             ColorBrush::Solid(solid) => solid.brush.as_ref().map(|id2d1_brush| id2d1_brush.into()),

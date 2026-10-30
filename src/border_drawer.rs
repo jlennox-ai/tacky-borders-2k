@@ -1,17 +1,15 @@
 use anyhow::Context;
 use std::time;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_F, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+    D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
     D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_BRUSH_PROPERTIES,
-    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE, ID2D1Brush,
-    ID2D1GeometrySink, ID2D1Multithread, ID2D1PathGeometry1, ID2D1RenderTarget,
+    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_BRUSH_PROPERTIES, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE, ID2D1Brush, ID2D1GeometrySink,
+    ID2D1PathGeometry1, ID2D1RenderTarget,
 };
-use windows::Win32::Graphics::Dxgi::IDXGISurface;
-use windows::core::Interface;
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::APP_STATE;
@@ -20,9 +18,9 @@ use crate::border_config::BorderConfig;
 use crate::colors::ColorBrush;
 use crate::config::BorderStyleConfig;
 use crate::effects::Effects;
-use crate::render_backend::{RenderBackend, RenderBackendConfig, TARGET_BITMAP_PROPS};
+use crate::render_backend::{RenderBackend, RenderBackendConfig};
 use crate::utils::{
-    StandaloneWindowsError, T_E_UNINIT, ToWindowsResult, WindowsCompatibleError,
+    LogIfErr, StandaloneWindowsError, T_E_UNINIT, ToWindowsResult, WindowsCompatibleError,
     WindowsCompatibleResult, WindowsContext, WriteLockable,
 };
 use crate::window_border::WindowState;
@@ -110,6 +108,49 @@ impl BorderDrawer {
         let _ = self.effects.take_inactive_command_list();
     }
 
+    /// Frees GPU memory that isn't needed while the border is hidden. It is recreated on the next
+    /// render.
+    pub fn release_hidden_resources(&mut self) {
+        let RenderBackend::V2(ref mut backend) = self.render_backend else {
+            return;
+        };
+
+        backend
+            .release_edges()
+            .context("could not release edge surfaces")
+            .log_if_err();
+
+        // The command lists hold references to the effect bitmaps, so drop them too
+        if self.effects.is_enabled() {
+            let _ = self.effects.take_active_command_list();
+            let _ = self.effects.take_inactive_command_list();
+            backend.release_extra_bitmaps();
+        }
+    }
+
+    /// Recreates any V2 resources that were released or not yet created.
+    fn ensure_v2_resources(&mut self, bounds: &D2D_RECT_F) -> WindowsCompatibleResult<()> {
+        let RenderBackend::V2(ref mut backend) = self.render_backend else {
+            return Ok(());
+        };
+
+        // The edges must cover everything drawn near them: the padding on both sides of the
+        // border (effects like glow also extend inwards), the stroke, and the corner arcs.
+        let padding = bounds.left.max(0.0);
+        let thickness = (padding * 2.0 + self.stroke_width as f32 + *self.corner_radius.get())
+            .ceil() as u32
+            + 2;
+        backend.ensure_edges(thickness)?;
+
+        if self.effects.is_enabled() && backend.ensure_extra_bitmaps()? {
+            self.effects
+                .init_command_lists_if_enabled(&self.render_backend)
+                .windows_context("could not initialize command lists")?;
+        }
+
+        Ok(())
+    }
+
     pub fn resize_renderer(&mut self, width: u32, height: u32) -> WindowsCompatibleResult<()> {
         self.render_backend
             .resize(width, height, self.effects.is_enabled())
@@ -149,6 +190,8 @@ impl BorderDrawer {
             radiusX: *self.corner_radius.get(),
             radiusY: *self.corner_radius.get(),
         };
+
+        self.ensure_v2_resources(&bounds)?;
 
         // Note that Rust's borrow checker prevents passing the render backend from the match arm,
         // so I'll need to grab it from within the respective functions instead
@@ -239,81 +282,33 @@ impl BorderDrawer {
                 ),
             ));
         };
-        let d2d_context = &backend.d2d_context;
 
-        unsafe {
-            // Determine which color should be drawn on top (for color fade animation)
-            let (bottom_color, top_color) = match window_state {
-                WindowState::Active => (&self.inactive_color, &self.active_color),
-                WindowState::Inactive => (&self.active_color, &self.inactive_color),
-            };
+        // Determine which color should be drawn on top (for color fade animation)
+        let (bottom_color, top_color) = match window_state {
+            WindowState::Active => (&self.inactive_color, &self.active_color),
+            WindowState::Inactive => (&self.active_color, &self.inactive_color),
+        };
 
-            // We're about to use DirectComposition which means we will be using the underlying
-            // Direct3D objects without Direct2D's knowledge. To avoid resource access conflict, we
-            // must explicitly acquire a lock. Read the following article for more info:
-            // https://learn.microsoft.com/en-us/windows/win32/direct2d/multi-threaded-direct2d-apps
-            let d2d_multithread: ID2D1Multithread = APP_STATE
-                .render_factory
-                .cast()
-                .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
-
-            // Set d2d_context's target back to the target_bitmap so we can draw to the display
-            let mut point = POINT::default();
-            let dxgi_surface: IDXGISurface = backend
-                .d_comp_surface
-                .BeginDraw(None, &mut point)
-                .windows_context("dxgi_surface")?;
-            let target_bitmap = d2d_context
-                .CreateBitmapFromDxgiSurface(&dxgi_surface, Some(&TARGET_BITMAP_PROPS))
-                .windows_context("target_bitmap")?;
-            d2d_context.SetTarget(&target_bitmap);
-
-            // Draw to the target_bitmap
-            d2d_context.BeginDraw();
-            d2d_context.Clear(None);
-
-            if bottom_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
-                if let ColorBrush::Gradient(gradient) = bottom_color {
-                    gradient.update_start_end_points(&bounds);
-                }
-
-                match bottom_color.get_brush() {
-                    Some(id2d1_brush) => {
-                        self.draw_border(&stroke_rect, d2d_context, bottom_color, id2d1_brush)?
-                    }
-                    None => debug!("ID2D1Brush for bottom_color has not been created yet"),
-                }
+        for color in [bottom_color, top_color] {
+            if let ColorBrush::Gradient(gradient) = color {
+                gradient.update_start_end_points(&bounds);
             }
-            if top_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
-                if let ColorBrush::Gradient(gradient) = top_color {
-                    gradient.update_start_end_points(&bounds);
-                }
-
-                match top_color.get_brush() {
-                    Some(id2d1_brush) => {
-                        self.draw_border(&stroke_rect, d2d_context, top_color, id2d1_brush)?
-                    }
-                    None => debug!("ID2D1Brush for top_color has not been created yet"),
-                }
-            }
-
-            d2d_context.EndDraw(None, None)?;
-
-            d2d_context.SetTarget(None);
-            backend
-                .d_comp_surface
-                .EndDraw()
-                .windows_context("d_comp_surface.EndDraw()")?;
-            backend
-                .d_comp_device
-                .Commit()
-                .windows_context("d_comp_device.Commit()")?;
-
-            d2d_multithread.Leave();
         }
 
-        Ok(())
+        backend.draw_edges(canvas_size(&bounds), |d2d_context| {
+            for color in [bottom_color, top_color] {
+                if color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
+                    match color.get_brush() {
+                        Some(id2d1_brush) => {
+                            self.draw_border(&stroke_rect, d2d_context, color, id2d1_brush)?
+                        }
+                        None => debug!("ID2D1Brush for color has not been created yet"),
+                    }
+                }
+            }
+
+            Ok(())
+        })
     }
 
     fn render_v2_with_effects(
@@ -432,62 +427,25 @@ impl BorderDrawer {
             d2d_context.EndDraw(None, None)?;
         }
 
-        unsafe {
-            // We're about to use DirectComposition which means we will be using the underlying
-            // Direct3D objects without Direct2D's knowledge. To avoid resource access conflict, we
-            // must explicitly acquire a lock. Read the following article for more info:
-            // https://learn.microsoft.com/en-us/windows/win32/direct2d/multi-threaded-direct2d-apps
-            let d2d_multithread: ID2D1Multithread = APP_STATE
-                .render_factory
-                .cast()
-                .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+        // Retrieve our command list (includes border_bitmap, mask_bitmap, and effects)
+        let command_list = self
+            .effects
+            .get_current_command_list(window_state)
+            .to_windows_result(T_E_UNINIT)?;
 
-            // Set d2d_context's target back to the target_bitmap so we can draw to the display
-            let mut point = POINT::default();
-            let dxgi_surface: IDXGISurface = backend
-                .d_comp_surface
-                .BeginDraw(None, &mut point)
-                .windows_context("dxgi_surface")?;
-            let target_bitmap = d2d_context
-                .CreateBitmapFromDxgiSurface(&dxgi_surface, Some(&TARGET_BITMAP_PROPS))
-                .windows_context("target_bitmap")?;
-            d2d_context.SetTarget(&target_bitmap);
+        backend.draw_edges(canvas_size(&bounds), |d2d_context| {
+            unsafe {
+                d2d_context.DrawImage(
+                    command_list,
+                    None,
+                    None,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                )
+            };
 
-            // Retrieve our command list (includes border_bitmap, mask_bitmap, and effects)
-            let command_list = self
-                .effects
-                .get_current_command_list(window_state)
-                .to_windows_result(T_E_UNINIT)?;
-
-            // Draw to the target_bitmap
-            d2d_context.BeginDraw();
-            d2d_context.Clear(None);
-
-            d2d_context.DrawImage(
-                command_list,
-                None,
-                None,
-                D2D1_INTERPOLATION_MODE_LINEAR,
-                D2D1_COMPOSITE_MODE_SOURCE_OVER,
-            );
-
-            d2d_context.EndDraw(None, None)?;
-
-            d2d_context.SetTarget(None);
-            backend
-                .d_comp_surface
-                .EndDraw()
-                .windows_context("d_comp_surface.EndDraw()")?;
-            backend
-                .d_comp_device
-                .Commit()
-                .windows_context("d_comp_device.Commit()")?;
-
-            d2d_multithread.Leave();
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 
     fn draw_border(
@@ -577,7 +535,14 @@ impl BorderDrawer {
         inset += unit;
 
         if face_width > 0.0 {
-            self.stroke_ring(renderer, &outer, outer_radius, inset, face_width, face_brush);
+            self.stroke_ring(
+                renderer,
+                &outer,
+                outer_radius,
+                inset,
+                face_width,
+                face_brush,
+            );
             inset += face_width;
         }
 
@@ -688,14 +653,34 @@ impl BorderDrawer {
             (outer.left + offset, outer.top, unit, frame_width),
             (outer.right - offset - unit, outer.top, unit, frame_width),
             // Bottom edge
-            (outer.left + offset, outer.bottom - frame_width, unit, frame_width),
-            (outer.right - offset - unit, outer.bottom - frame_width, unit, frame_width),
+            (
+                outer.left + offset,
+                outer.bottom - frame_width,
+                unit,
+                frame_width,
+            ),
+            (
+                outer.right - offset - unit,
+                outer.bottom - frame_width,
+                unit,
+                frame_width,
+            ),
             // Left edge
             (outer.left, outer.top + offset, frame_width, unit),
             (outer.left, outer.bottom - offset - unit, frame_width, unit),
             // Right edge
-            (outer.right - frame_width, outer.top + offset, frame_width, unit),
-            (outer.right - frame_width, outer.bottom - offset - unit, frame_width, unit),
+            (
+                outer.right - frame_width,
+                outer.top + offset,
+                frame_width,
+                unit,
+            ),
+            (
+                outer.right - frame_width,
+                outer.bottom - offset - unit,
+                frame_width,
+                unit,
+            ),
         ];
 
         unsafe {
@@ -827,6 +812,15 @@ fn blend_toward(color: &D2D1_COLOR_F, target: f32, amount: f32) -> D2D1_COLOR_F 
     }
 }
 
+/// Returns the size of the area covered by the border window, given bounds that are inset from it
+/// by the border padding on every side.
+fn canvas_size(bounds: &D2D_RECT_F) -> D2D_SIZE_U {
+    D2D_SIZE_U {
+        width: (bounds.right + bounds.left).ceil().max(0.0) as u32,
+        height: (bounds.bottom + bounds.top).ceil().max(0.0) as u32,
+    }
+}
+
 /// Builds an open path tracing half of a (rounded) rectangle's outline, splitting at the midpoint
 /// of the top-right and bottom-left corner arcs (or at the corners themselves when radius is 0).
 /// The top-left half runs from the bottom-left split point up and across to the top-right split
@@ -879,7 +873,10 @@ fn build_half_ring_path(
         } else {
             // Top-right arc midpoint -> down the right edge -> across the bottom edge ->
             // bottom-left arc midpoint
-            sink.BeginFigure(point(rect.right - k, rect.top + k), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.BeginFigure(
+                point(rect.right - k, rect.top + k),
+                D2D1_FIGURE_BEGIN_HOLLOW,
+            );
             if r > 0.0 {
                 arc_to(&sink, rect.right, rect.top + r);
             }

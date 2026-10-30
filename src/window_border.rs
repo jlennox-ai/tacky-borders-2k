@@ -21,9 +21,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DBT_DEVNODES_CHANGED, DefWindowProcW,
     GW_HWNDNEXT, GW_HWNDPREV, GWLP_USERDATA, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
     HWND_TOP, KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, PostQuitMessage, SET_WINDOW_POS_FLAGS,
-    SM_CMONITORS, SM_CXVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOREDRAW,
-    SWP_NOSENDCHANGING,
+    PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, PostQuitMessage, SET_WINDOW_POS_FLAGS, SM_CMONITORS,
+    SM_CXVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSENDCHANGING,
     SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
     SetWindowPos, WM_CREATE, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCDESTROY,
     WM_PAINT, WM_POWERBROADCAST, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WS_DISABLED,
@@ -821,6 +820,7 @@ impl WindowBorder {
                 if !self.should_show_border() {
                     self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
                     self.drawer.destroy_anims_timer();
+                    self.drawer.release_hidden_resources();
 
                     return LRESULT(0);
                 }
@@ -857,6 +857,9 @@ impl WindowBorder {
                 let update_pos_flags =
                     (!is_window_visible(self.border_window.0)).then_some(SWP_SHOWWINDOW);
                 self.update_position(update_pos_flags).log_if_err();
+
+                // Resources are released while the border is hidden, so it must be redrawn
+                needs_render |= update_pos_flags.is_some();
 
                 if needs_render {
                     self.render().log_if_err();
@@ -964,6 +967,7 @@ impl WindowBorder {
             WM_APP_HIDECLOAKED => {
                 self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
                 self.drawer.destroy_anims_timer();
+                self.drawer.release_hidden_resources();
                 self.is_paused = true;
             }
             // EVENT_OBJECT_MINIMIZESTART
@@ -975,6 +979,7 @@ impl WindowBorder {
                 self.drawer.inactive_color.set_opacity(0.0).log_if_err();
 
                 self.drawer.destroy_anims_timer();
+                self.drawer.release_hidden_resources();
                 self.is_paused = true;
             }
             // EVENT_SYSTEM_MINIMIZEEND

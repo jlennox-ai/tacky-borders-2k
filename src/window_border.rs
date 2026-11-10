@@ -3,7 +3,7 @@ use std::ptr;
 use std::thread;
 use std::time;
 use windows::Win32::Foundation::{
-    COLORREF, D2DERR_RECREATE_TARGET, FALSE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
+    COLORREF, D2DERR_RECREATE_TARGET, E_ACCESSDENIED, FALSE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{D2D1_BRUSH_PROPERTIES, ID2D1RenderTarget};
@@ -46,7 +46,7 @@ use crate::utils::{
     WM_APP_HIDECLOAKED, WM_APP_KOMOREBI, WM_APP_LOCATIONCHANGE, WM_APP_MINIMIZEEND,
     WM_APP_MINIMIZESTART, WM_APP_RECREATE_DRAWER, WM_APP_REORDER, WM_APP_SHOWUNCLOAKED,
     WindowsCompatibleError, WindowsCompatibleResult, WindowsContext, are_rects_same_size,
-    get_dpi_for_monitor, get_monitor_info, get_window_rule, get_window_title, has_native_border,
+    describe_window, get_dpi_for_monitor, get_monitor_info, get_window_rule, get_window_title, has_native_border,
     is_window, is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible,
     loword, monitor_from_window, post_message_w,
 };
@@ -457,19 +457,49 @@ impl WindowBorder {
                 ZOrderMode::BelowWindow => self.tracking_window,
             };
 
-            if let Err(e) = SetWindowPos(
-                self.border_window.0,
-                Some(hwndinsertafter),
-                self.window_rect.left,
-                self.window_rect.top,
-                self.window_rect.right - self.window_rect.left,
-                self.window_rect.bottom - self.window_rect.top,
-                swp_flags,
-            )
-            .context(format!(
-                "could not set window position for {:?}",
-                self.tracking_window
-            )) {
+            let set_pos = |flags: SET_WINDOW_POS_FLAGS| {
+                SetWindowPos(
+                    self.border_window.0,
+                    Some(hwndinsertafter),
+                    self.window_rect.left,
+                    self.window_rect.top,
+                    self.window_rect.right - self.window_rect.left,
+                    self.window_rect.bottom - self.window_rect.top,
+                    flags,
+                )
+            };
+
+            let mut result = set_pos(swp_flags);
+
+            // UIPI rejects inserting after a window owned by a higher-integrity (elevated) process
+            // with E_ACCESSDENIED. That's usually transient (e.g. a Windows Hello prompt), so don't
+            // tear down the border; just skip the z-order change. The next reorder event will fix
+            // the z-order once the elevated window is out of the way.
+            if let Err(err) = &result
+                && err.code() == E_ACCESSDENIED
+                && !swp_flags.contains(SWP_NOZORDER)
+            {
+                warn!(
+                    "access denied positioning border for {:?} after {}; retrying without z-order change",
+                    self.tracking_window,
+                    describe_window(hwndinsertafter)
+                );
+                result = set_pos(swp_flags | SWP_NOZORDER);
+            }
+
+            if let Err(e) = result.with_context(|| {
+                // ACCESS_DENIED here usually means hwndinsertafter belongs to a higher-integrity
+                // (elevated) process, which UIPI won't let us position relative to.
+                let insert_after = if hwndinsertafter == HWND_TOP {
+                    "HWND_TOP".to_string()
+                } else {
+                    describe_window(hwndinsertafter)
+                };
+                format!(
+                    "could not set window position for {}; hwndinsertafter: {insert_after}",
+                    describe_window(self.tracking_window)
+                )
+            }) {
                 self.cleanup_and_queue_exit();
                 return Err(e);
             }

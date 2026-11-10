@@ -526,6 +526,20 @@ pub fn get_window_process_name(hwnd: HWND) -> anyhow::Result<String> {
         .into_owned())
 }
 
+// Human-readable description of a window for diagnostics (process, pid, class, title).
+pub fn describe_window(hwnd: HWND) -> String {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    let process = get_window_process_name(hwnd).unwrap_or_else(|err| format!("<{err:#}>"));
+    let class = get_window_class(hwnd).unwrap_or_default();
+    let title = get_window_title(hwnd).unwrap_or_default();
+
+    format!(
+        "{hwnd:?} (process: {process}, pid: {pid}, class: {class:?}, title: {title:?}, visible: {})",
+        is_window_visible(hwnd)
+    )
+}
+
 // Get the window rule from 'window_rules' in the config
 pub fn get_window_rule(hwnd: HWND) -> WindowRule {
     let mut title_opt: Option<String> = None;

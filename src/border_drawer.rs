@@ -515,8 +515,9 @@ impl BorderDrawer {
         let face_brush: &ID2D1Brush = (&face_brush).into();
 
         // Band layout from the outside in: dark outline, raised bevel, face, sunken bevel, dark
-        // outline. 'unit' is the 1px-equivalent line thickness, scaled with the frame width.
-        let unit = (frame_width / 6.0).max(1.0);
+        // outline. 'unit' is the 1px-equivalent line thickness, scaled with the frame width. Frames
+        // too thin to fit the four lines at 1px each shrink the lines instead of overflowing.
+        let unit = (frame_width / 6.0).max(1.0).min(frame_width / 4.0);
         let face_width = (frame_width - unit * 4.0).max(0.0);
         let mut inset = 0.0f32;
 

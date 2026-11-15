@@ -55,7 +55,7 @@ jobs:
         run: cargo test --verbose
 
   release:
-    needs: build
+    needs: [build, test]
     runs-on: windows-latest
     if: github.ref_type == 'tag'
     permissions:
@@ -65,6 +65,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: ./artifacts/
+          merge-multiple: true
 
       - name: Compress artifacts
         run: |
@@ -84,5 +85,5 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          generate_release_notes: true
           files: ./artifacts/*

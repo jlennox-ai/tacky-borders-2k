@@ -3,7 +3,8 @@ use std::ptr;
 use std::thread;
 use std::time;
 use windows::Win32::Foundation::{
-    COLORREF, D2DERR_RECREATE_TARGET, E_ACCESSDENIED, FALSE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
+    COLORREF, D2DERR_RECREATE_TARGET, E_ACCESSDENIED, FALSE, HWND, LPARAM, LRESULT, RECT, TRUE,
+    WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{D2D1_BRUSH_PROPERTIES, ID2D1RenderTarget};
@@ -46,9 +47,9 @@ use crate::utils::{
     WM_APP_HIDECLOAKED, WM_APP_KOMOREBI, WM_APP_LOCATIONCHANGE, WM_APP_MINIMIZEEND,
     WM_APP_MINIMIZESTART, WM_APP_RECREATE_DRAWER, WM_APP_REORDER, WM_APP_SHOWUNCLOAKED,
     WindowsCompatibleError, WindowsCompatibleResult, WindowsContext, are_rects_same_size,
-    describe_window, get_dpi_for_monitor, get_monitor_info, get_window_rule, get_window_title, has_native_border,
-    is_window, is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible,
-    loword, monitor_from_window, post_message_w,
+    describe_window, get_dpi_for_monitor, get_monitor_info, get_window_rule, get_window_title,
+    has_native_border, is_window, is_window_arranged, is_window_cloaked, is_window_minimized,
+    is_window_visible, loword, monitor_from_window, post_message_w,
 };
 use crate::{APP_STATE, BG_SERVICES};
 

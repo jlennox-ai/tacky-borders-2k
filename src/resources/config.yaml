@@ -18,7 +18,14 @@ rendering_backend: V2
 # Global configuration options
 global:
   # border_width: Width of the border (in pixels)
-  border_width: 3
+  border_width: 6
+
+  # border_style: Look of the border. Supported values:
+  #   - Win2k: A classic Windows 2000-style frame with a 3D bevel and corner separators.
+  #       The bevel tones are derived from the border color (the first color of a gradient).
+  #       Looks best with a border_width of 4 or more.
+  #   - Modern: A flat border in the configured color or gradient
+  border_style: Win2k
 
   # border_offset: Offset of the border from the window edges (in pixels)
   #   - Negative values shrink the border inwards
@@ -98,15 +105,8 @@ global:
   #           light: "#000000"
   #       Each value (dark/light) can be a hex code, "accent", or a gradient.
   #       Borders automatically update when the system theme changes.
-  active_color:
-    colors: ["#6274e7", "#8752a3"]
-    direction: 45deg
-
-  inactive_color:
-    colors: ["#30304f", "#363c69"]
-    direction:
-      start: [0.0, 1.0]
-      end: [1.0, 0.0]
+  active_color: "#d4d0c8"
+  inactive_color: "#a8a49b"
 
   # komorebi_colors: Additional integration for komorebi's special window kinds
   #   - active_color is used for komorebi's "Single" window kind

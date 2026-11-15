@@ -284,11 +284,12 @@ pub enum ZOrderMode {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 pub enum BorderStyleConfig {
-    /// A flat, single-color border (the default)
-    #[default]
+    /// A flat border in the configured color or gradient
     Modern,
-    /// A classic Windows 2000-style frame: dark outlines, a raised 3D bevel around a medium
-    /// face band, and corner separator notches. Bevel tones are derived from the border color.
+    /// A classic Windows 2000-style frame (the default): dark outlines, a raised 3D bevel around
+    /// a medium face band, and corner separator notches. Bevel tones are derived from the border
+    /// color.
+    #[default]
     Win2k,
 }
 

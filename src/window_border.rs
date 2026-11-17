@@ -458,10 +458,10 @@ impl WindowBorder {
                 ZOrderMode::BelowWindow => self.tracking_window,
             };
 
-            let set_pos = |flags: SET_WINDOW_POS_FLAGS| {
+            let set_pos = |insert_after: Option<HWND>, flags: SET_WINDOW_POS_FLAGS| {
                 SetWindowPos(
                     self.border_window.0,
-                    Some(hwndinsertafter),
+                    insert_after,
                     self.window_rect.left,
                     self.window_rect.top,
                     self.window_rect.right - self.window_rect.left,
@@ -470,12 +470,16 @@ impl WindowBorder {
                 )
             };
 
-            let mut result = set_pos(swp_flags);
+            let mut result = set_pos(Some(hwndinsertafter), swp_flags);
 
             // UIPI rejects inserting after a window owned by a higher-integrity (elevated) process
             // with E_ACCESSDENIED. That's usually transient (e.g. a Windows Hello prompt), so don't
             // tear down the border; just skip the z-order change. The next reorder event will fix
             // the z-order once the elevated window is out of the way.
+            //
+            // The retry must pass a NULL hWndInsertAfter: win32k validates hWndInsertAfter (UIPI
+            // included) before it looks at SWP_NOZORDER, so retrying with the same elevated HWND
+            // fails with E_ACCESSDENIED again and the border gets torn down anyway.
             if let Err(err) = &result
                 && err.code() == E_ACCESSDENIED
                 && !swp_flags.contains(SWP_NOZORDER)
@@ -485,7 +489,7 @@ impl WindowBorder {
                     self.tracking_window,
                     describe_window(hwndinsertafter)
                 );
-                result = set_pos(swp_flags | SWP_NOZORDER);
+                result = set_pos(None, swp_flags | SWP_NOZORDER);
             }
 
             if let Err(e) = result.with_context(|| {

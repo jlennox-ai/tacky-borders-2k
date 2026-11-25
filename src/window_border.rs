@@ -85,6 +85,7 @@ pub struct WindowBorder {
     drawer: BorderDrawer,
     config: BorderConfig, // cached config values
     is_paused: bool,
+    is_updating_position: bool, // true while inside the SetWindowPos call in update_position()
     last_reorder_time: Option<time::Instant>,
     is_debouncing_reorder: bool,
     consecutive_reorders: u64,
@@ -107,6 +108,7 @@ impl WindowBorder {
             drawer: Default::default(),
             config: Default::default(),
             is_paused: Default::default(),
+            is_updating_position: false,
             last_reorder_time: None,
             is_debouncing_reorder: false,
             consecutive_reorders: 0,
@@ -470,6 +472,9 @@ impl WindowBorder {
                 )
             };
 
+            // SetWindowPos can synchronously send messages (e.g. WM_DPICHANGED) back to our window
+            // procedure, so let it know that it's being called from in here.
+            self.is_updating_position = true;
             let mut result = set_pos(Some(hwndinsertafter), swp_flags);
 
             // UIPI rejects inserting after a window owned by a higher-integrity (elevated) process
@@ -491,6 +496,7 @@ impl WindowBorder {
                 );
                 result = set_pos(None, swp_flags | SWP_NOZORDER);
             }
+            self.is_updating_position = false;
 
             if let Err(e) = result.with_context(|| {
                 // ACCESS_DENIED here usually means hwndinsertafter belongs to a higher-integrity
@@ -747,6 +753,36 @@ impl WindowBorder {
         Ok(is_updated)
     }
 
+    /// Re-queries the tracking window's monitor, then rescales the border and resizes the renderer
+    /// if its DPI or resolution isn't what we last scaled for.
+    ///
+    /// Location change events take care of this while the border is shown, but there are none
+    /// while it's hidden: a display change can move a minimized window to another monitor (or
+    /// change that monitor's DPI) without us hearing about it, so this must be called before the
+    /// border is shown again.
+    fn sync_with_monitor(&mut self) {
+        self.current_monitor = monitor_from_window(self.tracking_window);
+        if let Err(err) = self.rescale_border_and_resize_renderer_if_needed(self.current_monitor) {
+            error!("could not update appearance and renderer: {err:#}");
+        }
+    }
+
+    /// Moves the border back onto the tracking window and redraws it. This is for when the
+    /// border's own scale changes (DPI/display change): the stroke width and offset are part of
+    /// the border window's rect, and nothing guarantees that the tracking window will send a
+    /// location change event afterwards.
+    fn reposition_and_render_if_shown(&mut self) {
+        // The tracking window's rect is meaningless while it's hidden or minimized. Everything
+        // here gets redone when the border is shown again anyways.
+        if self.is_paused || !is_window_visible(self.border_window.0) {
+            return;
+        }
+
+        self.update_window_rect().log_if_err();
+        self.update_position(None).log_if_err();
+        self.render().log_if_err();
+    }
+
     /// Syncs the border's radius based on the tracking window's state (snapped/arranged or not),
     /// the cached radius config, and other current border parameters.
     ///
@@ -988,6 +1024,7 @@ impl WindowBorder {
                 }
 
                 if self.should_show_border() {
+                    self.sync_with_monitor();
                     self.update_color(None);
                     self.update_window_rect().log_if_err();
                     self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
@@ -1030,6 +1067,7 @@ impl WindowBorder {
                 thread::sleep(time::Duration::from_millis(self.config.unminimize_delay));
 
                 if self.should_show_border() {
+                    self.sync_with_monitor();
                     self.update_color(Some(self.config.unminimize_delay));
                     self.update_window_rect().log_if_err();
                     self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
@@ -1188,8 +1226,8 @@ impl WindowBorder {
                         }
                     };
 
-                if needs_render && is_window_visible(self.border_window.0) {
-                    self.render().log_if_err();
+                if needs_render {
+                    self.reposition_and_render_if_shown();
                 }
             }
             // Although we already check for DPI changes when the window moves between monitors,
@@ -1203,11 +1241,16 @@ impl WindowBorder {
                     self.current_dpi = new_dpi;
                     debug!("dpi has changed! new dpi: {new_dpi}");
 
-                    // TODO: Maybe call update_window_rect and update_position, though they get
-                    // handled on location change anyways
                     self.rescale_border(new_dpi);
                     self.resize_renderer().log_if_err();
-                    self.render().log_if_err();
+
+                    // If our own SetWindowPos call is what changed the DPI, don't move the border
+                    // again from in here: that could bounce between two monitors' DPIs forever.
+                    if self.is_updating_position {
+                        self.render().log_if_err();
+                    } else {
+                        self.reposition_and_render_if_shown();
+                    }
                 }
             }
             // This message is sent when a device is added or removed to the system. AFAIK, it
@@ -1251,6 +1294,9 @@ impl WindowBorder {
                         self.cleanup_and_queue_exit();
                         return LRESULT(0);
                     };
+                    // The displays may not be how we left them (e.g. a monitor that was turned
+                    // off before suspending), so don't trust the scale from before the suspend.
+                    self.sync_with_monitor();
                     self.init_border().log_if_err();
                 }
                 _ => {}
